@@ -1,0 +1,16 @@
+
+venv/
+.venv/
+env/
+__pycache__/
+*.py[cod]
+.env
+.streamlit/secrets.toml
+.ipynb_checkpoints/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+data/prediction_history.csv
+*.log
+*.tmp

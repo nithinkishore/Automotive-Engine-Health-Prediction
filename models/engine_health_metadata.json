@@ -1,0 +1,16 @@
+{
+    "model_name": "Random Forest",
+    "target_column": "Engine Condition",
+    "features": [
+        "Engine rpm",
+        "Lub oil pressure",
+        "Fuel pressure",
+        "Coolant pressure",
+        "lub oil temp",
+        "Coolant temp"
+    ],
+    "classes": [
+        "0",
+        "1"
+    ]
+}
