@@ -1,11 +1,19 @@
 
+import shap
+import matplotlib.pyplot as plt
+
+from maintenance_engine import (
+    explain_one_prediction,
+    build_maintenance_recommendations
+)
 from pathlib import Path
 from datetime import datetime
+import json
+import joblib
 
 import streamlit as st
 import pandas as pd
 import plotly.express as px
-import requests
 # Prediction history storage
 PROJECT_DIR = Path(__file__).resolve().parent.parent
 
@@ -23,7 +31,17 @@ HISTORY_FILE.parent.mkdir(
 PROJECT_DIR = Path(__file__).resolve().parent.parent
 REPORT_DIR = PROJECT_DIR / "reports"
 
-API_URL = "http://127.0.0.1:8000/predict"
+MODEL_DIR = PROJECT_DIR / "models"
+
+
+@st.cache_resource
+def load_model_artifacts():
+    """Load the trained model and preprocessing artifacts once."""
+    model = joblib.load(MODEL_DIR / "engine_health_model.joblib")
+    imputer = joblib.load(MODEL_DIR / "engine_health_imputer.joblib")
+    with open(MODEL_DIR / "engine_health_metadata.json", encoding="utf-8") as file:
+        metadata = json.load(file)
+    return model, imputer, metadata["features"]
 
 st.set_page_config(
     page_title="Automotive Engine Health AI",
@@ -98,11 +116,11 @@ with st.form("engine_prediction_form"):
 
     predict_button = st.form_submit_button(
         "🔍 Predict Engine Health",
-        use_container_width=True
+        width="stretch"
     )
 
 # --------------------------------------------------
-# 4. CALL FASTAPI PREDICTION ENDPOINT
+# 4. RUN LOCAL MODEL PREDICTION (NO FASTAPI REQUIRED)
 # --------------------------------------------------
 
 if predict_button:
@@ -117,33 +135,46 @@ if predict_button:
     }
 
     try:
-        with st.spinner("Analyzing engine sensor data..."):
+        with st.spinner("Loading model and analyzing engine sensor data..."):
+            model, imputer, features = load_model_artifacts()
 
-            response = requests.post(
-                API_URL,
-                json=sensor_data,
-                timeout=30
+            # Match the exact feature names and order used during training.
+            sensor_values = {
+                "Engine rpm": engine_rpm,
+                "Lub oil pressure": lub_oil_pressure,
+                "Fuel pressure": fuel_pressure,
+                "Coolant pressure": coolant_pressure,
+                "lub oil temp": lub_oil_temp,
+                "Coolant temp": coolant_temp
+            }
+
+            input_df = pd.DataFrame(
+                [[sensor_values[feature] for feature in features]],
+                columns=features
             )
+            processed_input = imputer.transform(input_df)
+            prediction = model.predict(processed_input)[0]
+            model_probabilities = model.predict_proba(processed_input)[0]
 
-        response.raise_for_status()
+            probabilities = {
+                str(class_label): float(probability)
+                for class_label, probability in zip(
+                    model.classes_, model_probabilities
+                )
+            }
 
-        result = response.json()
+            result = {
+                "predicted_class": str(prediction),
+                "class_probabilities": probabilities,
+                "prediction_confidence": float(max(model_probabilities)),
+                "model": "Random Forest"
+            }
 
         predicted_class = str(result["predicted_class"])
-
         probabilities = result["class_probabilities"]
-
-        unhealthy_probability = float(
-            probabilities["0"]
-        )
-
-        healthy_probability = float(
-            probabilities["1"]
-        )
-
-        confidence = float(
-            result["prediction_confidence"]
-        )
+        unhealthy_probability = float(probabilities["0"])
+        healthy_probability = float(probabilities["1"])
+        confidence = float(result["prediction_confidence"])
 
         # ------------------------------------------
         # 5. DISPLAY PREDICTION
@@ -153,70 +184,182 @@ if predict_button:
         st.subheader("📊 Engine Health Prediction Result")
 
         if predicted_class == "0":
-
-            st.error(
-                "⚠️ UNHEALTHY ENGINE CONDITION DETECTED"
-            )
-
+            st.error("⚠️ UNHEALTHY ENGINE CONDITION DETECTED")
             st.warning(
                 "The model classified this sensor reading "
                 "as an unhealthy engine condition. "
                 "Further inspection is recommended."
             )
-
             condition = "Unhealthy"
 
         elif predicted_class == "1":
-
-            st.success(
-                "✅ HEALTHY ENGINE CONDITION"
-            )
-
+            st.success("✅ HEALTHY ENGINE CONDITION")
             st.info(
                 "The model classified this sensor reading "
                 "as a healthy engine condition."
             )
-
             condition = "Healthy"
 
         else:
-            st.warning(
-                f"Unexpected predicted class: {predicted_class}"
-            )
+            st.warning(f"Unexpected predicted class: {predicted_class}")
             condition = "Unknown"
+
+
+        # --------------------------------------------------
+        # INDIVIDUAL SHAP EXPLANATION
+        # --------------------------------------------------
+
+        contribution_df = pd.DataFrame()
+        recommendation_df = pd.DataFrame()
+
+        maintenance_summary = (
+            "SHAP explanation unavailable. "
+            "Manual inspection is recommended."
+        )
+
+        try:
+
+            with st.spinner(
+                "Generating individual SHAP explanation..."
+            ):
+
+                shap_explanation, contribution_df = explain_one_prediction(
+                    model=model,
+                    processed_input=processed_input,
+                    feature_names=features,
+                    predicted_class=prediction,
+                    raw_sensor_values=sensor_values
+                )
+
+                # Generate maintenance recommendations
+                maintenance_summary, recommendation_df = (
+                    build_maintenance_recommendations(
+                        condition=condition,
+                        contribution_df=contribution_df,
+                        top_n=3
+                    )
+                )
+
+            st.divider()
+
+            st.header("🧠 Individual SHAP Explanation")
+
+            st.write(
+                "Understand how each engine sensor measurement "
+                "influenced this individual prediction."
+            )
+
+            # ------------------------------------------
+            # SHAP WATERFALL CHART
+            # ------------------------------------------
+
+            st.subheader("Individual SHAP Waterfall Plot")
+
+            shap.plots.waterfall(
+                shap_explanation,
+                max_display=len(features),
+                show=False
+            )
+
+            st.pyplot(
+                plt.gcf(),
+                clear_figure=True
+            )
+
+            plt.close("all")
+
+            # ------------------------------------------
+            # SHAP CONTRIBUTION TABLE
+            # ------------------------------------------
+
+            st.subheader("Individual Sensor Contributions")
+
+            st.dataframe(
+                contribution_df[
+                    [
+                        "Sensor",
+                        "Current Reading",
+                        "SHAP Contribution",
+                        "Direction"
+                    ]
+                ],
+                use_container_width=True,
+                hide_index=True
+            )
+
+            # ------------------------------------------
+            # SHAP CONTRIBUTION BAR CHART
+            # ------------------------------------------
+
+            contribution_chart = px.bar(
+                contribution_df.sort_values(
+                    "SHAP Contribution"
+                ),
+                x="SHAP Contribution",
+                y="Sensor",
+                orientation="h",
+                color="Direction",
+                title="Individual Sensor Contribution"
+            )
+
+            st.plotly_chart(
+                contribution_chart,
+                use_container_width=True
+            )
+            # ------------------------------------------
+            # AI-BASED PREDICTIVE MAINTENANCE
+            # ------------------------------------------
+
+            st.divider()
+
+            st.subheader("🔧 AI-Based Predictive Maintenance")
+
+            st.info(maintenance_summary)
+
+            if not recommendation_df.empty:
+                st.write("Recommended sensor inspections:")
+                st.dataframe(
+                    recommendation_df,
+                    use_container_width=True,
+                    hide_index=True
+                )
+            else:
+                st.warning(
+                    "No sensor-specific recommendations generated."
+                )
+
+            st.caption(
+                "Recommendations are decision-support suggestions "
+                "based on SHAP contributions, not confirmed fault diagnoses."
+            )
+
+        except Exception as shap_error:
+            st.warning(
+                "Individual SHAP explanation could not "
+                f"be generated: {shap_error}"
+            )
+
+
+            
+
+            
 
         # ------------------------------------------
         # 6. DISPLAY KPI METRICS
         # ------------------------------------------
 
         metric1, metric2, metric3 = st.columns(3)
-
-        metric1.metric(
-            "Predicted Condition",
-            condition
-        )
-
-        metric2.metric(
-            "Prediction Confidence",
-            f"{confidence * 100:.1f}%"
-        )
-
-        metric3.metric(
-            "ML Model",
-            result.get("model", "Random Forest")
-        )
+        metric1.metric("Predicted Condition", condition)
+        metric2.metric("Prediction Confidence", f"{confidence * 100:.1f}%")
+        metric3.metric("ML Model", result.get("model", "Random Forest"))
 
         # ------------------------------------------
         # 7. PROBABILITY VISUALIZATION
         # ------------------------------------------
 
         st.subheader("Prediction Probability")
-
         probability_df = pd.DataFrame({
-            "Engine Condition": [
-                "Unhealthy",
-                "Healthy"
-            ],
+            "Engine Condition": ["Unhealthy", "Healthy"],
             "Probability": [
                 unhealthy_probability * 100,
                 healthy_probability * 100
@@ -232,31 +375,24 @@ if predict_button:
             range_y=[0, 100],
             title="Engine Health Classification Probability"
         )
-
         fig.update_layout(
             yaxis_title="Probability (%)",
             xaxis_title="Engine Condition"
         )
-
-        st.plotly_chart(
-            fig,
-            use_container_width=True
-        )
+        st.plotly_chart(fig, use_container_width=True)
 
         # ------------------------------------------
         # 8. SENSOR MEASUREMENTS
         # ------------------------------------------
 
         st.subheader("Sensor Measurement Summary")
-
         sensor_df = pd.DataFrame({
             "Sensor": list(sensor_data.keys()),
             "Measured Value": list(sensor_data.values())
         })
-
         st.dataframe(
             sensor_df,
-            use_container_width=True,
+            width="stretch",
             hide_index=True
         )
 
@@ -268,53 +404,31 @@ if predict_button:
             st.session_state.prediction_history = []
 
         history_record = {
-            "Timestamp": datetime.now().strftime(
-                "%Y-%m-%d %H:%M:%S"
-            ),
+            "Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             **sensor_data,
             "Predicted Condition": condition,
             "Confidence (%)": round(confidence * 100, 2)
         }
+        st.session_state.prediction_history.append(history_record)
 
-        st.session_state.prediction_history.append(
-            history_record
-        )
-
-        # Save prediction history permanently to CSV
-        history_df = pd.DataFrame([history_record])
-
-        history_df.to_csv(
+        history_df_new = pd.DataFrame([history_record])
+        history_df_new.to_csv(
             HISTORY_FILE,
             mode="a",
             header=not HISTORY_FILE.exists(),
             index=False
         )
-
         st.success("Prediction saved to history!")
 
-    except requests.exceptions.ConnectionError:
+    except FileNotFoundError as error:
         st.error(
-            "Cannot connect to FastAPI. "
-            "Please start the API server first."
+            "A required model artifact could not be found. "
+            "Check that the models folder contains the model, imputer "
+            "and metadata files. Details: " + str(error)
         )
+    except Exception as error:
+        st.error(f"Local model prediction failed: {error}")
 
-    except requests.exceptions.Timeout:
-
-        st.error(
-            "The prediction request timed out."
-        )
-
-    except requests.exceptions.RequestException as error:
-
-        st.error(
-            f"API request failed: {error}"
-        )
-
-    except (KeyError, ValueError, TypeError) as error:
-
-        st.error(
-            f"Unexpected API response: {error}"
-        )
 
 # --------------------------------------------------
 # 10. SHAP FEATURE IMPORTANCE REPORT
@@ -350,7 +464,7 @@ if shap_csv.exists():
 
     st.plotly_chart(
         fig_shap,
-        use_container_width=True
+        width="stretch"
     )
 
 else:
@@ -377,7 +491,7 @@ with col1:
 
         st.image(
             str(shap_image),
-            use_container_width=True
+            width="stretch"
         )
 
 with col2:
@@ -388,7 +502,7 @@ with col2:
 
         st.image(
             str(rpm_image),
-            use_container_width=True
+            width="stretch"
         )
 
 # --------------------------------------------------
